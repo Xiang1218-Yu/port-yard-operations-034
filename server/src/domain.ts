@@ -79,7 +79,106 @@ export function containerPlan(containerId: string) {
   if (container.hazmatClass) reasons.push(`危险品 ${container.hazmatClass} 级，只能进入有隔离资质的区块`);
   return { container, recommendedBlock: selected, alternatives: ranked.slice(1, 3).map(item => item.block), reasons };
 }
-export function prioritizeTasks() { return tasks.map(task => ({ ...task, score: task.priority + (task.blockingReasons.length ? -20 : 10) + (task.kind === 'inspect' ? 12 : 0) })).sort((a, b) => b.score - a.score); }
+export function taskScore(task: YardTask) {
+  return task.priority + (task.blockingReasons.length ? -20 : 10) + (task.kind === 'inspect' ? 12 : 0);
+}
+export function prioritizeTasks() { return tasks.map(task => ({ ...task, score: taskScore(task) })).sort((a, b) => b.score - a.score); }
+
+export const TASK_KIND_LABELS: Record<YardTask['kind'], string> = {
+  receive: '进场接箱', deliver: '提箱送闸', rehandle: '翻箱移位', load: '装船', discharge: '卸船', inspect: '海关查验'
+};
+export const CONTAINER_STATUS_LABELS: Record<ContainerStatus, string> = {
+  'in-transit': '在途未进场', 'at-gate': '闸口待作业', 'in-yard': '场内堆存', 'on-quay': '码头边待吊', hold: '挂起待处理', released: '已放行离场'
+};
+export const TASK_STATUS_LABELS: Record<TaskStatus, string> = {
+  queued: '排队中', assigned: '已指派', executing: '执行中', blocked: '阻塞', done: '已完成'
+};
+export const CONTAINER_PRIORITY_LABELS: Record<Container['priority'], string> = {
+  normal: '普通', hot: '急箱', reefer: '冷藏优先', hazmat: '危险品监管'
+};
+
+const OPEN_TASK_STATUSES: readonly TaskStatus[] = ['queued', 'assigned', 'executing', 'blocked'];
+
+export interface BreakdownTaskRow { task: YardTask; score: number; container?: Container; orphan: boolean; priorityBasis: string[]; }
+export interface MovesBreakdown {
+  voyage: Voyage;
+  departed: boolean;
+  accounting: { planned: number; done: number; remaining: number; openTaskMoves: number; gapMoves: number; overrunMoves: number };
+  byContainerStatus: { key: ContainerStatus; label: string; count: number }[];
+  byTaskKind: { key: YardTask['kind']; label: string; count: number; blocked: number }[];
+  byBlockingReason: { reason: string; count: number; taskRefs: { taskId: string; containerId: string }[] }[];
+  rows: BreakdownTaskRow[];
+  untaskedContainers: Container[];
+  dataGaps: { code: string; severity: 'warning' | 'critical'; message: string }[];
+}
+
+// 把“计划 - 已完成”的聚合 moves 数字，与箱务台账、任务队列逐一对账，
+// 让调度员看清剩余 moves 由哪些现场作业组成，以及哪些 moves 在数据上无人认领。
+export function voyageMovesBreakdown(voyageId: string): MovesBreakdown | undefined {
+  const voyage = voyages.find(item => item.id === voyageId);
+  if (!voyage) return undefined;
+  const linkedTasks = tasks.filter(task => {
+    const owner = containers.find(item => item.id === task.containerId);
+    if (owner) return owner.voyageId === voyageId;
+    return task.to.includes(voyageId) || task.from.includes(voyageId);
+  });
+  const rows: BreakdownTaskRow[] = linkedTasks
+    .filter(task => OPEN_TASK_STATUSES.includes(task.status))
+    .map(task => {
+      const container = containers.find(item => item.id === task.containerId);
+      const priorityBasis = [
+        `调度基础优先级 ${task.priority}`,
+        task.blockingReasons.length ? `存在 ${task.blockingReasons.length} 项阻塞 · 计分 −20` : '当前无阻塞 · 计分 +10',
+        ...(task.kind === 'inspect' ? ['海关查验类作业 · 计分 +12'] : []),
+        ...(container ? [`箱务优先级：${CONTAINER_PRIORITY_LABELS[container.priority]}`] : ['任务引用箱号在台账中缺失'])
+      ];
+      return { task, score: taskScore(task), container, orphan: !container, priorityBasis };
+    })
+    .sort((a, b) => b.score - a.score);
+
+  const statusTally = new Map<ContainerStatus, number>();
+  for (const row of rows) if (row.container) statusTally.set(row.container.status, (statusTally.get(row.container.status) ?? 0) + 1);
+  const byContainerStatus = [...statusTally].map(([key, count]) => ({ key, label: CONTAINER_STATUS_LABELS[key], count })).sort((a, b) => b.count - a.count);
+
+  const kindTally = new Map<YardTask['kind'], { count: number; blocked: number }>();
+  for (const row of rows) {
+    const entry = kindTally.get(row.task.kind) ?? { count: 0, blocked: 0 };
+    entry.count += 1;
+    if (row.task.status === 'blocked') entry.blocked += 1;
+    kindTally.set(row.task.kind, entry);
+  }
+  const byTaskKind = [...kindTally].map(([key, value]) => ({ key, label: TASK_KIND_LABELS[key], ...value })).sort((a, b) => b.count - a.count);
+
+  const blockerTally = new Map<string, { count: number; taskRefs: { taskId: string; containerId: string }[] }>();
+  for (const row of rows) for (const reason of row.task.blockingReasons) {
+    const entry = blockerTally.get(reason) ?? { count: 0, taskRefs: [] };
+    entry.count += 1;
+    entry.taskRefs.push({ taskId: row.task.id, containerId: row.task.containerId });
+    blockerTally.set(reason, entry);
+  }
+  const byBlockingReason = [...blockerTally].map(([reason, value]) => ({ reason, ...value })).sort((a, b) => b.count - a.count);
+
+  const openContainerIds = new Set(rows.map(row => row.task.containerId));
+  const untaskedContainers = containers.filter(container => container.voyageId === voyageId && container.status !== 'released' && !openContainerIds.has(container.id));
+
+  const remaining = voyage.movesPlanned - voyage.movesDone;
+  const departed = voyage.status === 'departed';
+  const gapMoves = Math.max(0, remaining - rows.length);
+  const overrunMoves = Math.max(0, rows.length - remaining);
+  const dataGaps: MovesBreakdown['dataGaps'] = [];
+  if (voyage.movesDone > voyage.movesPlanned) dataGaps.push({ code: 'done-exceeds-plan', severity: 'critical', message: `已完成 ${voyage.movesDone} moves 超过计划 ${voyage.movesPlanned}，计划与实绩口径需要核对` });
+  if (departed && remaining > 0) dataGaps.push({ code: 'departed-with-remaining', severity: 'critical', message: `航次已离港，但仍有 ${remaining} 个 moves 未核销；这是台账对账缺口，不是现场待执行作业` });
+  if (departed && rows.length > 0) dataGaps.push({ code: 'departed-open-tasks', severity: 'critical', message: `已离港航次仍挂 ${rows.length} 条未完成任务，疑似现场状态未回传，任务不得再派工` });
+  if (!departed && gapMoves > 0) dataGaps.push({ code: 'uncovered-moves', severity: gapMoves > rows.length ? 'critical' : 'warning', message: `${gapMoves} 个剩余 moves 没有任何任务覆盖，调度台无法追踪到具体作业，需补录作业任务` });
+  if (overrunMoves > 0) dataGaps.push({ code: 'task-overrun', severity: 'warning', message: `未完成任务数比剩余 moves 多 ${overrunMoves}，存在重复派工或计划漏统` });
+  if (rows.some(row => row.orphan)) dataGaps.push({ code: 'orphan-task', severity: 'warning', message: `${rows.filter(row => row.orphan).length} 条任务引用的箱号在箱务台账中不存在，任务与箱务数据脱节` });
+
+  return {
+    voyage, departed,
+    accounting: { planned: voyage.movesPlanned, done: voyage.movesDone, remaining, openTaskMoves: rows.length, gapMoves, overrunMoves },
+    byContainerStatus, byTaskKind, byBlockingReason, rows, untaskedContainers, dataGaps
+  };
+}
 export function createAppointment(input: Omit<GateAppointment, 'id' | 'status' | 'sealVerified' | 'weightVerified'>) {
   const container = containers.find(item => item.id === input.containerId); if (!container) throw new Error('箱号不存在');
   if (container.customs !== 'released' && input.type === 'pickup') throw new Error('海关未放行，不能预约提箱');
