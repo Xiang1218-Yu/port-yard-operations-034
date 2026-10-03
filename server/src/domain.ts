@@ -80,6 +80,106 @@ export function containerPlan(containerId: string) {
   return { container, recommendedBlock: selected, alternatives: ranked.slice(1, 3).map(item => item.block), reasons };
 }
 export function prioritizeTasks() { return tasks.map(task => ({ ...task, score: task.priority + (task.blockingReasons.length ? -20 : 10) + (task.kind === 'inspect' ? 12 : 0) })).sort((a, b) => b.score - a.score); }
+
+export interface MovesGroup { key: string; count: number; taskIds: string[]; containerIds: string[]; }
+export interface MovesTaskUnit { taskId: string; kind: YardTask['kind']; containerId: string; status: TaskStatus; priority: number; score: number; blockingReasons: string[]; scheduledAt: string; estimatedMinutes: number; equipmentId?: string; }
+export interface MovesContainerUnit { containerId: string; status: ContainerStatus; direction: Container['direction']; customs: Container['customs']; priority: Container['priority']; yardSlot: string; taskIds: string[]; }
+export interface MovesDataGap { exists: boolean; unaccountedMoves: number; uncoveredContainerIds: string[]; note: string; }
+export interface VoyageMovesBreakdown {
+  voyage: { id: string; vessel: string; status: Voyage['status']; eta: string; etd: string; berth: string; lateRisk: Voyage['lateRisk'] };
+  closed: boolean;
+  movesPlanned: number;
+  movesDone: number;
+  remaining: number;
+  accountedMoves: number;
+  byContainerStatus: MovesGroup[];
+  byTaskKind: MovesGroup[];
+  byBlockingReason: MovesGroup[];
+  byPriority: MovesGroup[];
+  openTasks: MovesTaskUnit[];
+  pendingContainers: MovesContainerUnit[];
+  staleTasks: MovesTaskUnit[];
+  staleContainers: MovesContainerUnit[];
+  dataGap: MovesDataGap;
+  generatedAt: string;
+}
+
+const OPEN_TASK_STATUSES: TaskStatus[] = ['queued', 'assigned', 'executing', 'blocked'];
+const taskPriorityBand = (priority: number) => priority >= 100 ? 'urgent' : priority >= 80 ? 'high' : priority >= 50 ? 'medium' : 'normal';
+
+function toMovesTaskUnit(task: YardTask, score: number): MovesTaskUnit {
+  return { taskId: task.id, kind: task.kind, containerId: task.containerId, status: task.status, priority: task.priority, score, blockingReasons: task.blockingReasons, scheduledAt: task.scheduledAt, estimatedMinutes: task.estimatedMinutes, ...(task.equipmentId ? { equipmentId: task.equipmentId } : {}) };
+}
+function toMovesContainerUnit(container: Container, taskIds: string[]): MovesContainerUnit {
+  return { containerId: container.id, status: container.status, direction: container.direction, customs: container.customs, priority: container.priority, yardSlot: container.yardSlot, taskIds };
+}
+
+export function voyageMovesBreakdown(voyageId: string): VoyageMovesBreakdown | undefined {
+  const voyage = voyages.find(item => item.id === voyageId);
+  if (!voyage) return undefined;
+  const linkedContainers = containers.filter(item => item.voyageId === voyageId);
+  const linkedTasks = tasks.filter(item => linkedContainers.some(container => container.id === item.containerId));
+  const scoreOf = new Map(prioritizeTasks().map(item => [item.id, item.score]));
+  const openLinkedTasks = linkedTasks.filter(item => OPEN_TASK_STATUSES.includes(item.status));
+  const pendingContainers = linkedContainers.filter(item => item.status !== 'released');
+  const header = {
+    voyage: { id: voyage.id, vessel: voyage.vessel, status: voyage.status, eta: voyage.eta, etd: voyage.etd, berth: voyage.berth, lateRisk: voyage.lateRisk },
+    movesPlanned: voyage.movesPlanned, movesDone: voyage.movesDone,
+    remaining: Math.max(0, voyage.movesPlanned - voyage.movesDone), generatedAt: new Date().toISOString()
+  };
+  const taskIdsOf = (containerId: string) => openLinkedTasks.filter(task => task.containerId === containerId).map(task => task.id);
+  // 已离港航次：作业窗口关闭，未关闭记录只作为台账残留呈现，绝不能被当成现场待执行作业
+  if (voyage.status === 'departed') {
+    const staleTasks = openLinkedTasks.map(task => toMovesTaskUnit(task, scoreOf.get(task.id) ?? task.priority));
+    const staleContainers = pendingContainers.map(container => toMovesContainerUnit(container, taskIdsOf(container.id)));
+    return { ...header, closed: true, accountedMoves: 0, byContainerStatus: [], byTaskKind: [], byBlockingReason: [], byPriority: [], openTasks: [], pendingContainers: [], staleTasks, staleContainers, dataGap: { exists: false, unaccountedMoves: 0, uncoveredContainerIds: [], note: staleTasks.length || staleContainers.length ? '航次已离港，仍有未闭环台账记录，需要数据治理而非现场作业' : '航次已离港，作业全部闭环' } };
+  }
+  const statusMap = new Map<string, MovesGroup>();
+  const kindMap = new Map<string, MovesGroup>();
+  const reasonMap = new Map<string, MovesGroup>();
+  const priorityMap = new Map<string, MovesGroup>();
+  const bump = (map: Map<string, MovesGroup>, key: string, taskId?: string, containerId?: string) => {
+    const group = map.get(key) ?? { key, count: 0, taskIds: [], containerIds: [] };
+    group.count += 1;
+    if (taskId && !group.taskIds.includes(taskId)) group.taskIds.push(taskId);
+    if (containerId && !group.containerIds.includes(containerId)) group.containerIds.push(containerId);
+    map.set(key, group);
+  };
+  const sortedGroups = (map: Map<string, MovesGroup>) => [...map.values()].sort((a, b) => b.count - a.count || a.key.localeCompare(b.key));
+  const openTaskUnits: MovesTaskUnit[] = [];
+  for (const task of openLinkedTasks) {
+    const container = linkedContainers.find(item => item.id === task.containerId);
+    openTaskUnits.push(toMovesTaskUnit(task, scoreOf.get(task.id) ?? task.priority));
+    bump(statusMap, container?.status ?? 'unknown', task.id, task.containerId);
+    bump(kindMap, task.kind, task.id, task.containerId);
+    bump(priorityMap, taskPriorityBand(task.priority), task.id, task.containerId);
+    if (task.blockingReasons.length) task.blockingReasons.forEach(reason => bump(reasonMap, reason, task.id, task.containerId));
+    else bump(reasonMap, 'unblocked', task.id, task.containerId);
+  }
+  // 有箱务记录但没有任何未完成任务的箱：仍是剩余 moves，但任务队列里跟踪不到
+  const uncoveredContainers = pendingContainers.filter(container => !openLinkedTasks.some(task => task.containerId === container.id));
+  for (const container of uncoveredContainers) {
+    bump(statusMap, container.status, undefined, container.id);
+    bump(kindMap, 'unplanned', undefined, container.id);
+    bump(priorityMap, 'unplanned', undefined, container.id);
+  }
+  const accountedMoves = openLinkedTasks.length + uncoveredContainers.length;
+  const unaccountedMoves = Math.max(0, header.remaining - accountedMoves);
+  return {
+    ...header, closed: false, accountedMoves,
+    byContainerStatus: sortedGroups(statusMap), byTaskKind: sortedGroups(kindMap),
+    byBlockingReason: sortedGroups(reasonMap), byPriority: sortedGroups(priorityMap),
+    openTasks: openTaskUnits.sort((a, b) => b.score - a.score),
+    pendingContainers: pendingContainers.map(container => toMovesContainerUnit(container, taskIdsOf(container.id))),
+    staleTasks: [], staleContainers: [],
+    dataGap: {
+      exists: unaccountedMoves > 0 || uncoveredContainers.length > 0,
+      unaccountedMoves,
+      uncoveredContainerIds: uncoveredContainers.map(item => item.id),
+      note: unaccountedMoves > 0 ? `计划剩余 ${header.remaining} moves 中有 ${unaccountedMoves} moves 没有任何箱务或任务明细，需要 TOS 补发作业清单` : '箱务已建档但缺少任务派发'
+    }
+  };
+}
 export function createAppointment(input: Omit<GateAppointment, 'id' | 'status' | 'sealVerified' | 'weightVerified'>) {
   const container = containers.find(item => item.id === input.containerId); if (!container) throw new Error('箱号不存在');
   if (container.customs !== 'released' && input.type === 'pickup') throw new Error('海关未放行，不能预约提箱');
